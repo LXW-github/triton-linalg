@@ -89,6 +89,7 @@
 #include "llvm/IR/Attributes.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace mlir {
 class MLIRContext;
@@ -98,6 +99,78 @@ class MLIRContext;
 
 using namespace mlir;
 using namespace triton;
+
+/// @brief 创建一个包含操作（Operation）原始文本表示的NamedAttribute。
+///
+/// 这对于调试和溯源非常有用，可以将转换后的算子与原始的Triton算子关联起来。
+///
+/// @param op 原始的MLIR操作。
+/// @param rewriter ConversionPatternRewriter，用于创建Attribute。
+/// @return 一个mlir::NamedAttribute，其名称为 "triton_linalg.original_ir"。
+inline mlir::NamedAttribute
+getOriginalIrAttr(mlir::Operation *op,
+                  mlir::ConversionPatternRewriter &rewriter) {
+  // 定义一个标准化的属性名称
+  const std::string attrName = "triton_linalg.original_ir";
+
+  // 将原始操作的IR打印到字符串中
+  std::string irString;
+  llvm::raw_string_ostream os(irString);
+  op->print(os);
+
+  // 使用rewriter创建属性名和属性值
+  auto nameAttr = rewriter.getStringAttr(attrName);
+  auto valueAttr = rewriter.getStringAttr(os.str());
+
+  // 组合成NamedAttribute并返回
+  return mlir::NamedAttribute(nameAttr, valueAttr);
+}
+
+/// @brief 创建一个包含操作原始静态Shape的NamedAttribute。
+///
+/// 该函数会检查操作的第一个结果是否为RankedTensorType，并将其静态Shape
+/// 提取为一个I64数组属性。如果操作没有结果或结果类型不匹配，则返回std::nullopt。
+///
+/// @param op 原始的MLIR操作。
+/// @param rewriter ConversionPatternRewriter，用于创建Attribute。
+/// @return 一个可选的mlir::NamedAttribute，其名称为
+/// "triton_linalg.original_static_shape"。
+inline std::optional<mlir::NamedAttribute>
+getOriginalStaticShapeAttr(mlir::Operation *op,
+                           mlir::ConversionPatternRewriter &rewriter) {
+  // 定义一个标准化的属性名称
+  const std::string attrName = "triton_linalg.original_static_shape";
+
+  // 检查操作是否有结果
+  if (op->getNumResults() == 0) {
+    return std::nullopt;
+  }
+
+  // 获取第一个结果的类型，并尝试转换为RankedTensorType
+  auto resultType = op->getResult(0).getType();
+  auto tensorType = dyn_cast<mlir::RankedTensorType>(resultType);
+
+  if (!tensorType) {
+    return std::nullopt;
+  }
+
+  // 获取静态Shape (这是一个 int64_t 数组)
+  llvm::ArrayRef<int64_t> shape = tensorType.getShape();
+
+  // 将Shape的每个维度转换为一个mlir::Attribute
+  llvm::SmallVector<mlir::Attribute> shapeAttrs;
+  for (int64_t dim : shape) {
+    // ShapedType::kDynamic (-1) 也会被正确地记录为整数属性
+    shapeAttrs.push_back(rewriter.getI64IntegerAttr(dim));
+  }
+
+  // 使用rewriter创建属性名和最终的ArrayAttr属性值
+  auto nameAttr = rewriter.getStringAttr(attrName);
+  auto valueAttr = rewriter.getArrayAttr(shapeAttrs);
+
+  // 组合成NamedAttribute并返回
+  return mlir::NamedAttribute(nameAttr, valueAttr);
+}
 
 /// Return a new shape that contains the equal elements of srcShape and
 /// dstShape.
@@ -1108,6 +1181,12 @@ public:
     if (!tensorType)
       return failure();
 
+    SmallVector<NamedAttribute> newAttrs;
+    newAttrs.push_back(getOriginalIrAttr(op, rewriter));
+    if (auto shapeAttr = getOriginalStaticShapeAttr(op, rewriter)) {
+      newAttrs.push_back(*shapeAttr);
+    }
+
     auto hasZeroSize = llvm::any_of(tracker.getSizes(), [](const auto &size) {
       return isConstantIntValue(size, 0);
     });
@@ -1115,8 +1194,18 @@ public:
     Value falseVal =
         rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(false));
     if (!hasZeroSize) {
-      Value init = rewriter.create<tensor::EmptyOp>(
+      // Create the EmptyOp and get a handle to the operation itself.
+      auto emptyOp = rewriter.create<tensor::EmptyOp>(
           loc, tracker.getSizes(), tensorType.getElementType());
+
+      // Apply the collected attributes to the new EmptyOp.
+      for (const auto &attr : newAttrs) {
+        emptyOp->setAttr(attr.getName(), attr.getValue());
+      }
+
+      // Get the result value from the now-attributed operation.
+      Value init = emptyOp.getResult();
+
       Value trueVal =
           rewriter.create<arith::ConstantOp>(loc, rewriter.getBoolAttr(true));
       Value one =
@@ -1124,11 +1213,15 @@ public:
       SmallVector<OpFoldResult> offsets = llvm::to_vector(tracker.getStarts());
       // Replace with pad op.
       value = getPadOrInsertOpWithOther(loc, falseVal, tensorType, one, offsets,
-                                        tracker.getSizes(), rewriter);
+                                        tracker.getSizes(), rewriter, newAttrs);
     } else {
       Value init = rewriter.create<tensor::EmptyOp>(
           loc, tensorType.getShape(), tensorType.getElementType());
-      value = rewriter.create<linalg::FillOp>(loc, falseVal, init).getResult(0);
+      auto fillOp = rewriter.create<linalg::FillOp>(loc, falseVal, init);
+      for (const auto &attr : newAttrs) {
+        fillOp->setAttr(attr.getName(), attr.getValue());
+      }
+      value = fillOp.getResult(0);
     }
     rewriter.replaceOp(op, value);
     return success();

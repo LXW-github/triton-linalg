@@ -35,11 +35,10 @@ class MLIRContext;
 
 using namespace mlir;
 
-Value mlir::triton::getPadOrInsertOpWithOther(Location loc, Value other,
-                                              Type otherType, Value source,
-                                              ArrayRef<OpFoldResult> offsets,
-                                              ArrayRef<OpFoldResult> sizes,
-                                              OpBuilder &rewriter) {
+Value mlir::triton::getPadOrInsertOpWithOther(
+    Location loc, Value other, Type otherType, Value source,
+    ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
+    OpBuilder &rewriter, ArrayRef<NamedAttribute> extraAttrs) {
   auto otherShapedType = cast<ShapedType>(otherType);
   assert(otherShapedType.hasStaticShape() && "other val shape must be static.");
   Type elementType = otherShapedType.getElementType();
@@ -93,20 +92,27 @@ Value mlir::triton::getPadOrInsertOpWithOther(Location loc, Value other,
       highPads.push_back(
           rewriter.create<arith::SubIOp>(loc, dstDim, highOffset));
     }
-    return rewriter
-        .create<mlir::triton::linalg_ext::PadOp>(loc, source, padInit, pValue,
-                                                 lowPads, highPads)
-        .getResult()[0];
+    auto padOp = rewriter.create<mlir::triton::linalg_ext::PadOp>(
+        loc, source, padInit, pValue, lowPads, highPads);
+    for (const auto &attr : extraAttrs) {
+      padOp->setAttr(attr.getName(), attr.getValue());
+    }
+    return padOp.getResult()[0];
   } while (false);
 
-  return rewriter
-      .create<tensor::InsertSliceOp>(
-          loc, source, other,
-          /*offsets=*/offsets,
-          /*sizes=*/sizes,
-          /*strides=*/
-          SmallVector<OpFoldResult>(rank, rewriter.getIndexAttr(1)))
-      .getResult();
+  auto insertSliceOp = rewriter.create<tensor::InsertSliceOp>(
+      loc, source, other,
+      /*offsets=*/offsets,
+      /*sizes=*/sizes,
+      /*strides=*/
+      SmallVector<OpFoldResult>(rank, rewriter.getIndexAttr(1)));
+
+  // 遍历并附加额外的属性
+  for (const auto &attr : extraAttrs) {
+    insertSliceOp->setAttr(attr.getName(), attr.getValue());
+  }
+
+  return insertSliceOp.getResult();
 }
 
 StringAttr mlir::triton::getCacheModeAttr(MLIRContext *context,

@@ -32,10 +32,12 @@ namespace mlir {
 namespace triton {
 
 /// Get pad op or insert_slice op.
-Value getPadOrInsertOpWithOther(Location loc, Value other, Type otherType,
-                                Value source, ArrayRef<OpFoldResult> offsets,
-                                ArrayRef<OpFoldResult> sizes,
-                                OpBuilder &rewriter);
+Value getPadOrInsertOpWithOther(Location loc, Value other,
+                                              Type otherType, Value source,
+                                              ArrayRef<OpFoldResult> offsets,
+                                              ArrayRef<OpFoldResult> sizes,
+                                              OpBuilder &rewriter,
+                                              ArrayRef<NamedAttribute> extraAttrs = {});
 
 StringAttr getCacheModeAttr(MLIRContext *context, triton::CacheModifier mode);
 
